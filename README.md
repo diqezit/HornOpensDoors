@@ -46,4 +46,3 @@ Drop the folder in Mods That's it
 Only touches EntityVehicle.UseHorn as a postfix so vanilla horn sound and behavior stay exactly the same Door toggling goes through the same networked door system vanilla uses so it should work fine in multiplayer without special server setup
 
 Built against 3.0 internals Might break on other versions if these change
-```
