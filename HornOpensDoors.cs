@@ -7,103 +7,62 @@ using UnityEngine;
  HornOpensDoors
 
  Goal
- - One honk toggles (open/close) the nearest door strictly in front of, or
-   strictly behind, the vehicle.
- - If the door is to the side (vehicle is “sideways” relative to it), it
-   will NOT be touched, because we do not scan an area - only a straight
-   line.
- - Enforce a cooldown per vehicle so honk spam cannot spam door toggles.
+ -----
+ One honk toggles open or close on the nearest door strictly in front of
+ or strictly behind the vehicle
+ Enforce a cooldown per vehicle so honk spam cannot spam door toggles
+ Only the driver can toggle doors by honking, passengers cannot
 
  Why patch EntityVehicle.UseHorn instead of audio
-
- Vanilla horn use path is:
- - EntityVehicle.OnEntityActivated(..., EntityPlayerLocal _playerFocusing)
- - -> UseHorn(_playerFocusing)
-
- UseHorn is the real "horn pressed" event. Patching sound playback
- (Audio.Server.Play) is noisy, requires sound name filtering, and is
- not guaranteed to represent "a vehicle honked" (other things can play
- sounds). UseHorn is the cleanest single integration point.
+ -------------------------------------------------
+ UseHorn is the real horn pressed event Patching sound playback is noisy
+ requires sound name filtering and is not guaranteed to represent a
+ vehicle honked UseHorn is the cleanest single integration point
 
  Important networking note
- - UseHorn is called on the honking player's machine (it takes
-   EntityPlayerLocal). That means a dedicated server process usually
-   does NOT execute UseHorn for remote players.
- - Therefore this mod intentionally does NOT gate on IsServer.
- - Door toggling is done through TEFeatureDoor.SetOpen, which internally
-   performs the same networking vanilla uses:
-     - World.SetBlockRPC(...)
-     - TileEntity.SetModified() (client -> server or server -> clients)
+ --------------------------
+ UseHorn is called on the honking player's machine Door toggling is done
+ through TEFeatureDoor.SetOpen which already includes local client side
+ prediction animation and sound before sending the network update
 
- ----------------------------------------------------------------------------
- Config
-
- Loaded via DynamicProperties.Load(modPath, ConfigName), which uses the
- game's own XmlFile loader. The config file format is the standard
- property XML used by 7DTD:
-
-   <HornOpensDoors>
-     <property name="ScanDistance" value="12"/>
-     <property name="CooldownSeconds" value="3"/>
-   </HornOpensDoors>
-
- If the file is missing or a value is absent/invalid:
- - compiled defaults are kept
-
- ScanDistance is clamped to 1..12.
-
- ----------------------------------------------------------------------------
  What the mod does in order
+ ---------------------------
+ 1 Patch UseHorn
+   Harmony Postfix on EntityVehicle.UseHorn so vanilla still plays the
+   horn sound and we only add the door behavior after that
 
- 1) Patch UseHorn
+ 2 Driver check
+   Compare the honking player against whoever is attached in seat 0 the
+   driver seat If they do not match a passenger honked or nobody is
+   driving so we exit
 
- Harmony Postfix on EntityVehicle.UseHorn.
- Postfix is used so vanilla still plays the horn sound / triggers honk
- events normally, and we only add the door behavior after that.
+ 3 Per vehicle cooldown using ticks
+   Cooldown is stored per vehicle entityId using GameTimer ticks at 20
+   ticks per second If now minus last is less than CooldownTicks the
+   honk is ignored
 
- 2) Per-vehicle cooldown (ticks, not Time.time)
+ 4 Parallelepiped scan front and back only
+   We use vehicle.transform.forward flattened to the XZ plane We scan in
+   two passes forward box first then backward box if nothing toggled
+   The box is 5 blocks wide and 3 blocks high extending up to
+   ScanDistance blocks forward This covers a wide area without complex
+   math and catches doors slightly off center from the vehicle path
 
- The cooldown is stored per vehicle entityId.
- To avoid floating time drift and to match vanilla tick-driven systems,
- we use GameTimer.Instance.ticks (20 ticks/sec).
+ 5 Locked and lockpick doors are skipped
+   A found door is not toggled if TEFeatureLockPickable.NeedsLockpicking
+   returns true or TEFeatureLockable.IsLocked returns true The scan
+   continues to find an unlocked door in the area
 
- - CooldownTicks = ceil(CooldownSeconds * 20)
- - If now - last < CooldownTicks => ignore this honk
+ 6 Multiblock child handling
+   Doors can be multiblock The scan may hit a child block where
+   BlockValue.ischild is true In that case we move to the parent block
+   position using BlockValue.parent
 
- 3) Direction constraint (front/back only)
-
- We use vehicle.transform.forward (flattened to XZ plane) as the only
- direction basis.
-
- We search in two passes:
- - forward line first
- - if nothing toggled, backward line
-
- 4) Line scan (no area scan)
-
- For each step 1..ScanDistance:
- - compute block cell at origin + direction * step
- - if air: keep going
- - if solid:
-     - if it is a tile entity door and is not locked: toggle and stop
-     - otherwise stop immediately (line of sight blocked)
-
- 5) Locked / lockpick doors are skipped
-
- A found door is not toggled if:
- - TEFeatureLockPickable.NeedsLockpicking() == true
- - TEFeatureLockable.IsLocked() == true
-
- 6) Multiblock child handling
-
- Doors can be multiblock. The ray may hit a child block (BlockValue.ischild).
- In that case we move to the parent block position using the stored
- parent offsets on BlockValue:
- - parent = childPos + (parentx, parenty, parentz)
-
- ----------------------------------------------------------------------------
- Integration points (for future migration)
+ Integration points
+ -------------------
  EntityVehicle.UseHorn(EntityPlayerLocal)
+ EntityVehicle.HasDriver
+ EntityVehicle.GetAttached(int)
  DynamicProperties.Load / ParseInt / ParseFloat
  GameTimer.Instance.ticks
  World.worldToBlockPos(Vector3)
@@ -113,6 +72,7 @@ using UnityEngine;
  TEFeatureDoor.IsOpen / SetOpen
  TEFeatureLockable.IsLocked
  TEFeatureLockPickable.NeedsLockpicking
+ BlockValue.ischild / parent
 */
 
 public sealed class HornOpensDoors : IModApi
@@ -120,11 +80,12 @@ public sealed class HornOpensDoors : IModApi
     internal const string HarmonyId = "HornOpensDoors";
     internal const string ConfigName = "HornOpensDoors";
 
-    internal const int MaxScanDistance = 12;
+    internal const int MaxScanDistance = 25;
+    internal const float MaxCooldownSeconds = 3f;
     internal const float TicksPerSecond = 20f;
 
-    internal static int ScanDistance = 12;
-    internal static float CooldownSeconds = 3f;
+    internal static int ScanDistance = MaxScanDistance;
+    internal static float CooldownSeconds = MaxCooldownSeconds;
     internal static ulong CooldownTicks = 60UL;
 
     public void InitMod(Mod modInstance)
@@ -146,17 +107,7 @@ public sealed class HornOpensDoors : IModApi
             }
         }
 
-        FixCfg();
-    }
-
-    private static void FixCfg()
-    {
-        ScanDistance = Mathf.Clamp(ScanDistance, 1, MaxScanDistance);
-        CooldownSeconds = Mathf.Max(0f, CooldownSeconds);
-
-        CooldownTicks = (CooldownSeconds <= 0f)
-            ? 0UL
-            : (ulong)Mathf.CeilToInt(CooldownSeconds * TicksPerSecond);
+        CooldownTicks = (ulong)Mathf.CeilToInt(CooldownSeconds * TicksPerSecond);
     }
 }
 
@@ -166,16 +117,14 @@ public static class Patch_HornOpensDoors
     private static readonly Dictionary<int, ulong> lastTick =
         new Dictionary<int, ulong>();
 
-    private static void Postfix(EntityVehicle __instance)
+    private static void Postfix(
+        EntityVehicle __instance,
+        EntityPlayerLocal player)
     {
-        if (__instance == null)
-            return;
-
-        if (!CanRun(__instance.entityId))
-            return;
-
         World world = GameManager.Instance?.World;
-        if (world == null)
+
+        if (__instance == null || player == null || world == null
+            || !IsDriver(__instance, player) || !CanRun(__instance.entityId))
             return;
 
         try
@@ -188,6 +137,11 @@ public static class Patch_HornOpensDoors
         }
     }
 
+    private static bool IsDriver(EntityVehicle v, EntityPlayerLocal player)
+    {
+        return v.HasDriver && v.GetAttached(0) == player;
+    }
+
     private static bool CanRun(int id)
     {
         if (HornOpensDoors.CooldownTicks == 0UL)
@@ -195,9 +149,9 @@ public static class Patch_HornOpensDoors
 
         ulong now = GameTimer.Instance.ticks;
 
-        if (lastTick.TryGetValue(id, out ulong last) &&
-            now >= last &&
-            now - last < HornOpensDoors.CooldownTicks)
+        if (lastTick.TryGetValue(id, out ulong last)
+            && now >= last
+            && now - last < HornOpensDoors.CooldownTicks)
         {
             return false;
         }
@@ -216,60 +170,57 @@ public static class Patch_HornOpensDoors
 
         fwd.Normalize();
 
+        Vector3 right = Vector3.Cross(Vector3.up, fwd).normalized;
+
         Vector3 org = v.position;
         org.y += 0.5f;
 
-        if (ToggleLine(world, org, fwd))
+        if (ToggleBox(world, org, fwd, right))
             return;
 
-        ToggleLine(world, org, -fwd);
+        ToggleBox(world, org, -fwd, right);
     }
 
-    private static bool ToggleLine(World world, Vector3 org, Vector3 dir)
+    private static bool ToggleBox(World world, Vector3 org, Vector3 dir, Vector3 right)
     {
         for (int i = 1; i <= HornOpensDoors.ScanDistance; i++)
         {
-            Vector3i p = World.worldToBlockPos(org + dir * i);
+            Vector3 step = org + dir * i;
 
-            BlockValue bv = world.GetBlock(p);
-            if (bv.isair)
-                continue;
-
-            ITileEntity te = world.GetTileEntity(ParentPos(p, bv));
-
-            if (!te.TryGetSelfOrFeature<TEFeatureDoor>(out TEFeatureDoor door))
-                return false;
-
-            if (te.TryGetSelfOrFeature<TEFeatureLockPickable>(
-                    out TEFeatureLockPickable lp) &&
-                lp.NeedsLockpicking())
+            for (int h = -1; h <= 1; h++)
             {
-                return false;
-            }
+                for (int w = -2; w <= 2; w++)
+                {
+                    Vector3 pos = step + right * w + Vector3.up * h;
+                    Vector3i p = World.worldToBlockPos(pos);
 
-            if (te.TryGetSelfOrFeature<TEFeatureLockable>(
-                    out TEFeatureLockable lk) &&
-                lk.IsLocked())
-            {
-                return false;
-            }
+                    BlockValue bv = world.GetBlock(p);
+                    if (bv.isair)
+                        continue;
 
-            door.SetOpen(!door.IsOpen(), true);
-            return true;
+                    Vector3i tilePos = bv.ischild ? p + bv.parent : p;
+                    ITileEntity te = world.GetTileEntity(tilePos);
+
+                    if (te == null)
+                        continue;
+
+                    if (!te.TryGetSelfOrFeature(out TEFeatureDoor door))
+                        continue;
+
+                    if (te.TryGetSelfOrFeature(out TEFeatureLockPickable lp)
+                        && lp.NeedsLockpicking())
+                        continue;
+
+                    if (te.TryGetSelfOrFeature(out TEFeatureLockable lk)
+                        && lk.IsLocked())
+                        continue;
+
+                    door.SetOpen(!door.IsOpen(), true);
+                    return true;
+                }
+            }
         }
 
         return false;
-    }
-
-    private static Vector3i ParentPos(Vector3i p, BlockValue bv)
-    {
-        if (!bv.ischild)
-            return p;
-
-        return new Vector3i(
-            p.x + bv.parentx,
-            p.y + bv.parenty,
-            p.z + bv.parentz
-        );
     }
 }
